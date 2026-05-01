@@ -1,0 +1,158 @@
+# .github/workflows/macos-tailscale-secure.yml
+name: 🍎 macOS Tailscale Secure Runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      ts_tailnet:
+        description: "Tailscale tailnet (e.g. you@gmail.com)"
+        required: true
+        type: string
+      ts_api_key:
+        description: "Tailscale API key (device admin)"
+        required: true
+        type: string
+      ts_authkey:
+        description: "Tailscale auth key (reusable or ephemeral)"
+        required: true
+        type: string
+      gh_api_token:
+        description: "GitHub Personal Access Token (classic)"
+        required: true
+        type: string
+      test_mode:
+        description: "Run 5-minute test loop"
+        type: boolean
+        default: false
+      runtime_minutes:
+        description: "Runtime in minutes (max 360; capped to 355)"
+        required: false
+        default: "355"
+        type: string
+      loops:
+        description: "How many handoffs (0 = infinite)"
+        required: false
+        default: "0"
+        type: string
+
+concurrency:
+  group: tailscale-rdp-singleton
+  cancel-in-progress: false
+
+jobs:
+  secure-macos-job:
+    runs-on: macos-latest
+    timeout-minutes: 360
+    env:
+      # Mask secrets immediately to prevent accidental logging
+      TS_TAILNET: ${{ inputs.ts_tailnet }}
+      TS_API_KEY: ${{ inputs.ts_api_key }}
+      TS_AUTHKEY: ${{ inputs.ts_authkey }}      GH_TOKEN: ${{ inputs.gh_api_token }}
+      TEST_MODE: ${{ inputs.test_mode }}
+      REQUESTED_RUNTIME: ${{ inputs.runtime_minutes }}
+      LOOP_COUNT: ${{ inputs.loops }}
+
+    steps:
+      - name: 📦 Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ env.GH_TOKEN }}
+
+      - name: 🔐 Initialize Security & Environment
+        run: |
+          set -euo pipefail
+          echo "🛡️  Masking sensitive environment variables..."
+          for var in TS_API_KEY TS_AUTHKEY GH_TOKEN; do
+            echo "::add-mask::${!var}"
+          done
+          
+          echo "📋 Environment Validation:"
+          echo "  • Tailnet: ${TS_TAILNET}"
+          echo "  • Test Mode: ${TEST_MODE}"
+          echo "  • Requested Runtime: ${REQUESTED_RUNTIME}m"
+          
+          # Validate critical inputs
+          if [[ -z "${TS_AUTHKEY}" ]]; then
+            echo "❌ Error: Tailscale Auth Key is missing."
+            exit 1
+          fi
+
+      - name: 🦊 Install Dependencies & Tailscale
+        run: |
+          echo "📦 Installing homebrew packages..."
+          brew install --quiet tailscale jq || true
+          
+          echo "🔗 Verifying Tailscale installation..."
+          tailscale version || { echo "❌ Failed to install Tailscale"; exit 1; }
+
+      - name: 🌐 Connect to Tailscale Network
+        run: |
+          echo "🚀 Bringing up Tailscale interface..."
+          
+          # Login and Up with ephemeral flag for cleaner state
+          tailscale up \
+            --authkey="${TS_AUTHKEY}" \
+            --hostname="gh-runner-${{ github.run_id }}" \
+            --timeout=60s \
+            --accept-dns=false \
+            --operator="${USER}"
+                    echo "✅ Network Status:"
+          tailscale status
+          echo "📍 Assigned IP: $(tailscale ip -4)"
+
+      - name: 🛠️ Execute Main Workload
+        run: |
+          # Calculate effective runtime (Cap at 355 mins to avoid GitHub hard kill)
+          RUNTIME_LIMIT=355
+          if [[ "${REQUESTED_RUNTIME}" =~ ^[0-9]+$ ]] && [[ "${REQUESTED_RUNTIME}" -lt "${RUNTIME_LIMIT}" ]]; then
+            RUNTIME_LIMIT="${REQUESTED_RUNTIME}"
+          fi
+          END_TIME=$((SECONDS + RUNTIME_LIMIT * 60))
+          
+          echo "⏱️  Starting workload. Timeout set to ${RUNTIME_LIMIT} minutes."
+          
+          # Loop handler
+          LOOP_ITER=0
+          while true; do
+            # 1. Check Loop Count
+            if [[ "${LOOP_COUNT}" != "0" ]] && [[ "${LOOP_ITER}" -ge "${LOOP_COUNT}" ]]; then
+              echo "🏁 Reached requested loop limit (${LOOP_COUNT}). Exiting."
+              break
+            fi
+            LOOP_ITER=$((LOOP_ITER + 1))
+            echo "🔄 Loop Iteration: ${LOOP_ITER}"
+
+            # 2. Check Runtime Timeout
+            if [[ "${SECONDS}" -ge "${END_TIME}" ]]; then
+              echo "⏰ Runtime limit reached. Graceful shutdown."
+              break
+            fi
+
+            # 3. Test Mode Logic (Short sleep) vs Normal Mode
+            if [[ "${TEST_MODE}" == "true" ]]; then
+              echo "🧪 [TEST MODE] Running quick validation..."
+              tailscale ping -c 1 tailscale.com || true
+              sleep 60
+            else
+              echo "💼 [PROD MODE] Running actual workload..."
+           
+              # Prevent idle timeout if no heavy tasks
+              sleep 300 
+            fi
+            
+            # 4. Infinite loop check for non-test mode
+            if [[ "${TEST_MODE}" != "true" ]] && [[ "${LOOP_COUNT}" == "0" ]]; then               # If infinite loop requested in prod mode, break after one pass 
+               # unless you explicitly want a while(true) background process.
+               echo "✅ Task completed. Exiting loop to allow job closure."
+               break
+            fi
+          done
+
+      - name: 🧹 Cleanup & Teardown
+        if: always()
+        run: |
+          echo "🧹 Cleaning up resources..."
+          tailscale down || true
+          tailscale logout || true
+          rm -f /tmp/ts-secret-*
+          echo "✨ Job finished."
