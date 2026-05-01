@@ -1,0 +1,31 @@
+name: macOS VNC Test
+
+on: [push]
+
+jobs:
+  vnc-test:
+    runs-on: macos-latest
+    
+    steps:
+      - name: Enable Screen Sharing via Command Line
+        run: |
+          sudo defaults write /var/db/launchd.db/com.apple.launchd/overrides.plist com.apple.screensharing -dict Disabled -bool false
+          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist
+          
+      - name: Set VNC Password
+        run: |
+          # මෙය ආරක්ෂිත නොවේ. Production සඳහා Secrets භාවිතා කරන්න.
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart -activate -configure -access -on -clientopts -setvnclegacy -vnclegacy yes -clientopts -setvncpw -vncpw mypassword123 -restart -agent -privs -all
+
+      - name: Start Ngrok for VNC
+        env:
+          NGROK_TOKEN: ${{ 3D7iMyrxXoLNjGLDsrX6ZZUcV7p_5Jd4oquawKcQm3xjtzhfP }}
+        run: |
+          brew install ngrok/ngrok/ngrok
+          ngrok config add-authtoken $NGROK_TOKEN
+          ngrok tcp 5900 --log stdout &
+          sleep 10
+          echo "Check Ngrok dashboard for the public URL"
+          
+      - name: Keep Runner Alive (for testing)
+        run: sleep 300
